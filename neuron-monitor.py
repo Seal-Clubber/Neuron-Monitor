@@ -150,7 +150,7 @@ async def main_loop():
                 for j, result in enumerate(batch_results):
                     idx = i + j
                     results[idx] = result
-                    print(f"[{idx:>3}] {"YourIpHere:24601":<22} | {result}")
+                    print(f"[{idx:>3}] {ip_ports[idx]:<22} | {result}")
 
             try:
                 choice, target = await asyncio.to_thread(menu_handler, ip_ports)
