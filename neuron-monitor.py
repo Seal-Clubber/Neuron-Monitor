@@ -7,7 +7,7 @@ import sys
 import webbrowser
 
 # Batch settings
-BATCH_SIZE = 15
+BATCH_SIZE = 5
 SEM = asyncio.Semaphore(BATCH_SIZE)
 
 # ANSI escape regex for padding
@@ -29,30 +29,27 @@ def colorize(value, thresholds=(50, 80)):
     except:
         return pad_ansi(f"{value}", 6)
     if val < thresholds[0]:
-        return pad_ansi(f"\033[91m{val:.1f}%\033[0m", 6)  # red
+        return pad_ansi(f"\033[91m{val:.1f}%\033[0m", 6)
     elif val < thresholds[1]:
-        return pad_ansi(f"\033[93m{val:.1f}%\033[0m", 6)  # yellow
+        return pad_ansi(f"\033[93m{val:.1f}%\033[0m", 6)
     else:
-        return pad_ansi(f"\033[92m{val:.1f}%\033[0m", 6)  # green
+        return pad_ansi(f"\033[92m{val:.1f}%\033[0m", 6)
 
 def colorize_placement(position, max_val=100):
     try:
         val = int(position)
     except:
         return position
-
     score = min(max(val - 1, 0), max_val - 1) / (max_val - 1)
-
     if score <= 0.2:
-        color = "\033[92m"  # green
+        color = "\033[92m"
     elif score <= 0.5:
-        color = "\033[93m"  # yellow
+        color = "\033[93m"
     elif score <= 0.8:
-        color = "\033[38;5;208m"  # orange
+        color = "\033[38;5;208m"
     else:
-        color = "\033[91m"  # red
-
-    return f"{color}{val}/100\033[0m"
+        color = "\033[91m"
+    return f"{color}{val}\033[0m/100"
 
 async def fetch(session, url):
     try:
@@ -82,19 +79,92 @@ def parse_wallet_stats(text):
         return f"{comps} comps, avg pos {pos}"
     return "Stats: N/A"
 
+def parse_vault_short(delegate_data):
+    try:
+        parsed = json.loads(delegate_data)
+        if isinstance(parsed, list) and parsed:
+            vault = parsed[0].get("vault", "")
+            if len(vault) >= 6:
+                return f"{vault[:4]}..{vault[-4:]}"
+            return vault
+    except:
+        return "N/A       "
+
+def parse_stake_check(stake_data):
+    try:
+        if stake_data == "True":
+            return "True "
+        else:
+            return "N/A  "
+    except:
+        return "N/A  "
+
+def parse_connection_status(data):
+    try:
+        parsed = json.loads(data)
+        central = parsed.get("central")
+        pubsub = parsed.get("pubsub")
+        if isinstance(central, bool) and isinstance(pubsub, bool):
+            c = "\033[92mOnline\033[0m" if central else "\033[91mClosed\033[0m"
+            p = "\033[92mOnline\033[0m" if pubsub else "\033[91mClosed\033[0m"
+            return f"{c}/{p}"
+    except Exception:
+        pass
+    return "N/A          "
+
+def parse_wallet_short(api_test_data):
+    try:
+        parsed = json.loads(api_test_data)
+        wallet = parsed.get("data", "")
+        if len(wallet) >= 8:
+            return f"{wallet[:4]}..{wallet[-4:]}"
+        return wallet
+    except:
+        return "N/A       "
+
+def parse_satori_amount(html_text):
+    try:
+        match = re.search(r"Satori:\s*([0-9.]+)", html_text)
+        if match:
+            return match.group(1).rjust(6)
+    except:
+        pass
+    return "N/A   "
+
+def format_satori(satori_val, stake_status):
+    if stake_status.strip() == "N/A":
+        return f"\033[91m{satori_val}\033[0m"  # red
+    return satori_val
+
 async def process_ip(session, ip_port):
     sys_url = f"http://{ip_port}/system_metrics"
     stats_url = f"http://{ip_port}/fetch/wallet/stats/daily"
+    delegate_get_url = f"http://{ip_port}/delegate/get"
+    stake_check_url = f"http://{ip_port}/stake/check"
+    status_url = f"http://{ip_port}/connections-status/refresh"
+    api_test_url = f"http://{ip_port}/api/test"
+    chat_url = f"http://{ip_port}/chat"
 
-    sys_data, stats_data = await asyncio.gather(
+    sys_data, stats_data, delegate_get_data, stake_check_data, conn_status_data, api_test_data, chat_data = await asyncio.gather(
         fetch(session, sys_url),
-        fetch(session, stats_url)
+        fetch(session, stats_url),
+        fetch(session, delegate_get_url),
+        fetch(session, stake_check_url),
+        fetch(session, status_url),
+        fetch(session, api_test_url),
+        fetch(session, chat_url)
     )
 
     version, cpu, mem, uptime = parse_system_metrics(sys_data)
     stats = parse_wallet_stats(stats_data)
+    vault_trunc = parse_vault_short(delegate_get_data)
+    stake = parse_stake_check(stake_check_data)
+    conn_status = parse_connection_status(conn_status_data)
+    wallet_trunc = parse_wallet_short(api_test_data)
+    satori_raw = parse_satori_amount(chat_data)
+    satori = format_satori(satori_raw, stake)
 
-    return f"{version} | {cpu} | {mem} | {uptime} | {stats}"
+    return f"{version} | {cpu} | {mem} | {uptime} | {vault_trunc} | {stake} | {conn_status} | {wallet_trunc} | {satori} | {stats}"
 
 async def limited_process_ip(session, ip_port):
     async with SEM:
@@ -138,8 +208,8 @@ async def main_loop():
         while True:
             os.system("cls" if os.name == "nt" else "clear")
             print(f"===== Fetching Data - Made by SealClubber =====")
-            print(f"{'Idx':<5} {'IP:PORT':<22} | {'Ver':<7} | {'CPU':<6} | {'MEM':<6} | {'Uptime':<7} | Stats")
-            print("-" * 95)
+            print(f"{'Idx':<5} {'IP:PORT':<22} | {'Version':<7} | {'CPU':<6} | {'MEM':<6} | {'Uptime':<7} | {'Delegate':<10} | {'Stake':<5} | {'CENT/PUBSUB':<13} | {'Wallet':<10} | {'Satori':<6} | Stats")
+            print("-" * 154)
 
             results = [None] * len(ip_ports)
             for i in range(0, len(ip_ports), BATCH_SIZE):
