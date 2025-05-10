@@ -3,16 +3,16 @@ import aiohttp
 import json
 import re
 import os
-import sys
-import webbrowser
 
-# Batch settings
-BATCH_SIZE = 5
-SEM = asyncio.Semaphore(BATCH_SIZE)
+# Settings
+BATCH_AT_ONCE = 3
+PARENT_STATUS_URL = "http://localhost:24601/proxy/parent/status"
 
-# ANSI escape regex for padding
-ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+# Global rewards mapping
+wallet_rewards = {}
 
+# Utility functions
+ansi_escape = re.compile(r'\x1B\[[0-?9;]*[mK]')
 def real_length(s):
     return len(ansi_escape.sub('', s))
 
@@ -23,7 +23,7 @@ def read_ip_ports(file_path):
     with open(file_path, "r") as f:
         return [line.strip() for line in f if line.strip()]
 
-def colorize(value, thresholds=(50, 80)):
+def colorize_cpu(value, thresholds=(50, 80)):
     try:
         val = float(value)
     except:
@@ -35,35 +35,57 @@ def colorize(value, thresholds=(50, 80)):
     else:
         return pad_ansi(f"\033[92m{val:.1f}%\033[0m", 6)
 
-def colorize_placement(position, max_val=100):
+def colorize_mem(value, thresholds=(50, 80)):
+    try:
+        val = float(value)
+    except:
+        return pad_ansi(f"{value}", 6)
+    if val < thresholds[0]:
+        return pad_ansi(f"\033[92m{val:.1f}%\033[0m", 6)
+    elif val < thresholds[1]:
+        return pad_ansi(f"\033[93m{val:.1f}%\033[0m", 6)
+    else:
+        return pad_ansi(f"\033[91m{val:.1f}%\033[0m", 6)
+
+def colorize_placement(position):
     try:
         val = int(position)
     except:
         return position
-    score = min(max(val - 1, 0), max_val - 1) / (max_val - 1)
-    if score <= 0.2:
+    if val < 51:
         color = "\033[92m"
-    elif score <= 0.5:
-        color = "\033[93m"
-    elif score <= 0.8:
-        color = "\033[38;5;208m"
     else:
-        color = "\033[91m"
+        color = "\033[38;5;208m"
     return f"{color}{val}\033[0m/100"
 
 async def fetch(session, url):
     try:
         async with session.get(url) as response:
             return await response.text()
-    except Exception:
+    except:
         return None
+
+async def fetch_parent_rewards(session):
+    global wallet_rewards
+    data = await fetch(session, PARENT_STATUS_URL)
+    if data:
+        try:
+            parsed = json.loads(data)
+            wallet_rewards = {}
+            for entry in parsed:
+                wallet = entry.get("address", "").strip()
+                reward = entry.get("reward", 0)
+                if wallet:
+                    wallet_rewards[wallet] = reward
+        except:
+            pass
 
 def parse_system_metrics(data):
     try:
         parsed = json.loads(data)
         version = parsed.get("version", "N/A").ljust(7)
-        cpu = colorize(parsed.get("cpu_usage_percent", "N/A"))
-        mem = colorize(parsed.get("memory", {}).get("percent", "N/A"))
+        cpu = colorize_cpu(parsed.get("cpu_usage_percent", "N/A"))
+        mem = colorize_mem(parsed.get("memory", {}).get("percent", "N/A"))
         uptime = f"{parsed.get('uptime', 0) / 3600:.2f}h".ljust(7)
         return version, cpu, mem, uptime
     except:
@@ -84,155 +106,108 @@ def parse_vault_short(delegate_data):
         parsed = json.loads(delegate_data)
         if isinstance(parsed, list) and parsed:
             vault = parsed[0].get("vault", "")
-            if len(vault) >= 6:
+            if len(vault) >= 8:
                 return f"{vault[:4]}..{vault[-4:]}"
-            return vault
+            else:
+                return vault
     except:
-        return "N/A       "
+        pass
+    return "\033[91mN/A\033[0m       "
 
 def parse_stake_check(stake_data):
-    try:
-        if stake_data == "True":
-            return "True "
-        else:
-            return "N/A  "
-    except:
-        return "N/A  "
+    if stake_data == "True":
+        return "\033[92mTrue\033[0m "
+    else:
+        return "\033[91mN/A \033[0m "
 
-def parse_connection_status(data):
-    try:
-        parsed = json.loads(data)
-        central = parsed.get("central")
-        pubsub = parsed.get("pubsub")
-        if isinstance(central, bool) and isinstance(pubsub, bool):
-            c = "\033[92mOnline\033[0m" if central else "\033[91mClosed\033[0m"
-            p = "\033[92mOnline\033[0m" if pubsub else "\033[91mClosed\033[0m"
-            return f"{c}/{p}"
-    except Exception:
-        pass
-    return "N/A          "
-
-def parse_wallet_short(api_test_data):
+def parse_wallet(api_test_data):
     try:
         parsed = json.loads(api_test_data)
-        wallet = parsed.get("data", "")
-        if len(wallet) >= 8:
-            return f"{wallet[:4]}..{wallet[-4:]}"
-        return wallet
+        return parsed.get("data", "N/A").ljust(34)
     except:
-        return "N/A       "
-
-def parse_satori_amount(html_text):
-    try:
-        match = re.search(r"Satori:\s*([0-9.]+)", html_text)
-        if match:
-            return match.group(1).rjust(6)
-    except:
-        pass
-    return "N/A   "
-
-def format_satori(satori_val, stake_status):
-    if stake_status.strip() == "N/A":
-        return f"\033[91m{satori_val}\033[0m"  # red
-    return satori_val
+        return "N/A                               "
 
 async def process_ip(session, ip_port):
     sys_url = f"http://{ip_port}/system_metrics"
     stats_url = f"http://{ip_port}/fetch/wallet/stats/daily"
     delegate_get_url = f"http://{ip_port}/delegate/get"
     stake_check_url = f"http://{ip_port}/stake/check"
-    status_url = f"http://{ip_port}/connections-status/refresh"
     api_test_url = f"http://{ip_port}/api/test"
-    chat_url = f"http://{ip_port}/chat"
 
-    sys_data, stats_data, delegate_get_data, stake_check_data, conn_status_data, api_test_data, chat_data = await asyncio.gather(
+    sys_data, stats_data, delegate_data, stake_data, api_test_data = await asyncio.gather(
         fetch(session, sys_url),
         fetch(session, stats_url),
         fetch(session, delegate_get_url),
         fetch(session, stake_check_url),
-        fetch(session, status_url),
-        fetch(session, api_test_url),
-        fetch(session, chat_url)
+        fetch(session, api_test_url)
     )
 
     version, cpu, mem, uptime = parse_system_metrics(sys_data)
     stats = parse_wallet_stats(stats_data)
-    vault_trunc = parse_vault_short(delegate_get_data)
-    stake = parse_stake_check(stake_check_data)
-    conn_status = parse_connection_status(conn_status_data)
-    wallet_trunc = parse_wallet_short(api_test_data)
-    satori_raw = parse_satori_amount(chat_data)
-    satori = format_satori(satori_raw, stake)
+    vault_trunc = parse_vault_short(delegate_data)
+    stake = parse_stake_check(stake_data)
+    wallet = parse_wallet(api_test_data)
 
-    return f"{version} | {cpu} | {mem} | {uptime} | {vault_trunc} | {stake} | {conn_status} | {wallet_trunc} | {satori} | {stats}"
+    wallet_clean = wallet.strip()
+    reward = wallet_rewards.get(wallet_clean, None)
 
-async def limited_process_ip(session, ip_port):
-    async with SEM:
+    if reward is not None:
+        reward_text = f"{reward:.4f}".rjust(6)
+    else:
+        reward_text = "N/A   "
+
+    return f"{version} | {cpu} | {mem} | {uptime} | {vault_trunc} | {stake} | {wallet} | {reward_text} | {stats}"
+
+async def limited_process_ip(session, sem, ip_port):
+    async with sem:
         return await process_ip(session, ip_port)
 
-async def run_extra_command(session, ip_port):
-    url = f"http://{ip_port}/power/shutdown"
-    print(f"\nTriggering reboot: {url}")
-    response = await fetch(session, url)
-    if response:
-        print(f"Response:\n{response}")
-        print(f"Refreshing...")
-    else:
-        print("No response or error.")
-
-def open_browser(ip_port):
-    url = f"http://{ip_port}"
-    print(f"\nOpening browser to {url}...")
-    webbrowser.open(url)
-
-def menu_handler(ip_ports):
-    user_input = input("\nEnter index to open menu (or just press Enter to exit): ").strip()
-    if user_input == "":
-        return "exit", None
-    if not user_input.isdigit():
-        return None, None
-    index = int(user_input)
-    if not (0 <= index < len(ip_ports)):
-        print("Invalid index.")
-        return None, None
-
-    print("\nChoose action:")
-    print("1. Reboot")
-    print("2. Open in browser")
-    choice = input("Enter choice (1/2, or Enter to refresh): ").strip()
-    return choice, ip_ports[index] if choice in ("1", "2") else None
-
-async def main_loop():
-    ip_ports = read_ip_ports("ip.txt")
+async def display_loop(ip_ports):
+    sem = asyncio.Semaphore(5)
+    os.system("cls" if os.name == "nt" else "clear")
     async with aiohttp.ClientSession() as session:
-        while True:
-            os.system("cls" if os.name == "nt" else "clear")
-            print(f"===== Fetching Data - Made by SealClubber =====")
-            print(f"{'Idx':<5} {'IP:PORT':<22} | {'Version':<7} | {'CPU':<6} | {'MEM':<6} | {'Uptime':<7} | {'Delegate':<10} | {'Stake':<5} | {'CENT/PUBSUB':<13} | {'Wallet':<10} | {'Satori':<6} | Stats")
-            print("-" * 154)
+        await fetch_parent_rewards(session)
 
-            results = [None] * len(ip_ports)
-            for i in range(0, len(ip_ports), BATCH_SIZE):
-                batch = ip_ports[i:i + BATCH_SIZE]
-                tasks = [limited_process_ip(session, ip) for ip in batch]
-                batch_results = await asyncio.gather(*tasks)
+        print(f"===== Neuron Monitor - Made by SealClubber =====")
+        print(f"{'Idx':<5} {'IP:PORT':<22} | {'Version':<7} | {'CPU':<6} | {'MEM':<6} | {'Uptime':<7} | {'Delegate':<10} | {'Stake':<5} | {'Wallet':<34} | {'Reward':<6} | Stats")
+        print("-" * 29 + "+" + "-" * 9 + "+" + "-" * 8 + "+" + "-" * 8 + "+" + "-" * 9 + "+" + "-" * 12 + "+" + "-" * 7 + "+" + "-" * 36 + "+" + "-" * 8 + "+" + "-" * 27)
 
-                for j, result in enumerate(batch_results):
-                    idx = i + j
-                    results[idx] = result
-                    print(f"[{idx:>3}] {ip_ports[idx]:<22} | {result}")
+        rewards_list = []
 
-            try:
-                choice, target = await asyncio.to_thread(menu_handler, ip_ports)
-                if choice == "exit":
-                    print("Exiting logger.")
-                    return
-                if choice == "1" and target:
-                    await run_extra_command(session, target)
-                elif choice == "2" and target:
-                    open_browser(target)
-            except Exception as e:
-                print(f"Menu error: {e}")
+        for i in range(0, len(ip_ports), BATCH_AT_ONCE):
+            batch = ip_ports[i:i+BATCH_AT_ONCE]
+            tasks = [limited_process_ip(session, sem, ip) for ip in batch]
+            results = await asyncio.gather(*tasks)
+
+            for j, result in enumerate(results):
+                idx = i + j
+                print(f"[{idx:>3}] {ip_ports[idx]:<22} | {result}")
+
+                parts = result.split('|')
+                if len(parts) >= 8:
+                    reward_str = parts[7].strip()
+                    try:
+                        reward_value = float(reward_str)
+                        rewards_list.append(reward_value)
+                    except:
+                        pass
+
+    non_zero_rewards = [reward for reward in wallet_rewards.values() if reward > 0]
+
+    print("\n===== Full Parent-Child Reward Summary =====")
+    if non_zero_rewards:
+        total_reward = sum(non_zero_rewards)
+        avg_reward = total_reward / len(non_zero_rewards)
+        max_reward = max(non_zero_rewards)
+        min_reward = min(non_zero_rewards)
+
+        print(f"Total reward:   {total_reward:>10.4f}")
+        print(f"Average reward: {avg_reward:>10.4f}")
+        print(f"Max reward:     {max_reward:>10.4f}")
+        print(f"Min reward:     {min_reward:>10.4f}")
+    else:
+        print("No non-zero rewards found.")
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    ip_ports = read_ip_ports("ip.txt")
+    asyncio.run(display_loop(ip_ports))
